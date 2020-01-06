@@ -27,33 +27,50 @@
 package org.flyve.inventory.categories;
 
 import android.content.Context;
+import android.content.pm.PackageManager;
+import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Rect;
+import android.graphics.SurfaceTexture;
 import android.hardware.Camera;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.ExifInterface;
+import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
+import android.provider.MediaStore;
+import android.text.TextUtils;
+import android.util.Log;
 import android.util.Size;
 import android.util.SizeF;
 
 import org.flyve.inventory.CommonErrorType;
 import org.flyve.inventory.InventoryLog;
+import org.flyve.inventory.InventoryTask;
 import org.flyve.inventory.Utils;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 /**
  * This class get all the information of the Cameras
@@ -94,7 +111,7 @@ public class Cameras
                     Category c = new Category("CAMERAS", "cameras");
                     CameraCharacteristics chars = getCharacteristics(xCtx, index);
                     if (chars != null) {
-                        c.put("RESOLUTION", new CategoryValue(getResolution(chars), "RESOLUTION", "resolution"));
+                        c.put("RESOLUTION", new CategoryValue(getResolution(chars, index), "RESOLUTION", "resolution"));
                         c.put("LENSFACING", new CategoryValue(getFacingState(chars), "LENSFACING", "lensfacing"));
                         c.put("FLASHUNIT", new CategoryValue(getFlashUnit(chars), "FLASHUNIT", "flashunit"));
                         c.put("IMAGEFORMATS", new CategoryValue(getImageFormat(chars), "IMAGEFORMATS", "imageformats"));
@@ -158,38 +175,63 @@ public class Cameras
 
     /**
      * Get resolution from the camera
-     * @param characteristics
+     * First with Camera API, then with CameraCharacteristics API
+     * @param characteristics, index
      * @return String resolution camera
      */
-    public String getResolution(CameraCharacteristics characteristics) {
-        String value = "N/A";
+    public String getResolution(CameraCharacteristics characteristics, int index) {
+        Camera cam;
+        String value;
+
         try {
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-                int width = 0, height = 0;
-                StreamConfigurationMap sizes = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-                if (sizes != null) {
-                    Size[] outputSizes = sizes.getOutputSizes(256);
-                    if (outputSizes == null || outputSizes.length <= 0) {
-                        Rect rect = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
-                        if (rect != null) {
-                            width = rect.width();
-                            height = rect.height();
+            cam = Camera.open(index);
+            Camera.Parameters params = cam.getParameters();
+            long max_v = 0;
+            Camera.Size max_sz = null;
+            for (Camera.Size sz : params.getSupportedPictureSizes()) {
+                long v = sz.height * sz.width;
+                if (v > max_v) {
+                    max_v = v;
+                    max_sz = sz;
+                }
+            }
+            cam.release();
+            value = max_sz.width + "x" + max_sz.height;
+        } catch (RuntimeException ex) {
+            InventoryLog.e(InventoryLog.getMessage(context, CommonErrorType.CAMERA_RESOLUTION, ex.getMessage()));
+            value = "N/A";
+        }
+
+        if(value.equalsIgnoreCase("N/A")){
+            try {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                    int width = 0, height = 0;
+                    StreamConfigurationMap sizes = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+                    if (sizes != null) {
+                        Size[] outputSizes = sizes.getOutputSizes(256);
+                        if (outputSizes == null || outputSizes.length <= 0) {
+                            Rect rect = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+                            if (rect != null) {
+                                width = rect.width();
+                                height = rect.height();
+                            }
+                        } else {
+                            Size size = outputSizes[outputSizes.length - 1];
+                            width = size.getWidth();
+                            height = size.getHeight();
                         }
+                        value = width + "x" + height;
                     } else {
-                        Size size = outputSizes[outputSizes.length - 1];
-                        width = size.getWidth();
-                        height = size.getHeight();
+                        return value;
                     }
-                    value = width + "x" + height;
                 } else {
                     return value;
                 }
-            } else {
-                return value;
+            } catch (Exception ex) {
+                InventoryLog.e(InventoryLog.getMessage(context, CommonErrorType.CAMERA_RESOLUTION, ex.getMessage()));
             }
-        } catch (Exception ex) {
-            InventoryLog.e(InventoryLog.getMessage(context, CommonErrorType.CAMERA_RESOLUTION, ex.getMessage()));
         }
+
         return value;
     }
 
@@ -279,6 +321,9 @@ public class Cameras
                 return "YUY2";
             case 32:
                 return "RAW_SENSOR";
+            case 34:
+                //Android private opaque image format
+                return "PRIVATE";
             case 35:
                 return "YUV_420_888";
             case 37:
@@ -391,38 +436,155 @@ public class Cameras
         return value;
     }
 
+    private static Map<String, String> getFullCameraParameters (Camera cam) {
+        Map<String, String> result = new HashMap<String, String>(64);
+        final String TAG = "CameraParametersRetrieval";
+
+        try {
+            Class camClass = cam.getClass();
+
+            //Internally, Android goes into native code to retrieve this String of values
+            Method getNativeParams = camClass.getDeclaredMethod("native_getParameters");
+            getNativeParams.setAccessible(true);
+
+            //Boom. Here's the raw String from the hardware
+            String rawParamsStr = (String) getNativeParams.invoke(cam);
+
+            //But let's do better. Here's what Android uses to parse the
+            //String into a usable Map -- a simple ';' StringSplitter, followed
+            //by splitting on '='
+            //
+            //Taken from Camera.Parameters unflatten() method
+            TextUtils.StringSplitter splitter = new TextUtils.SimpleStringSplitter(';');
+            splitter.setString(rawParamsStr);
+
+            for (String kv : splitter) {
+                int pos = kv.indexOf('=');
+                if (pos == -1) {
+                    continue;
+                }
+                String k = kv.substring(0, pos);
+                String v = kv.substring(pos + 1);
+                result.put(k, v);
+            }
+
+            //And voila, you have a map of ALL supported parameters
+            return result;
+        } catch (NoSuchMethodException ex) {
+            Log.e("CAMERA", ex.toString());
+        } catch (IllegalAccessException ex) {
+            Log.e("CAMERA", ex.toString());
+        } catch (InvocationTargetException ex) {
+            Log.e("CAMERA", ex.toString());
+        }
+
+        //If there was any error, just return an empty Map
+        Log.e("CAMERA", "Unable to retrieve parameters from Camera.");
+        return result;
+    }
+
     /**
      * Get manufacturer camera
      * @param index number of the camera
      * @return String manufacturer camera
      */
     public String getManufacturer(int index) {
+
+        Camera cam = Camera.open(index);
+        Map<String, String> infos = getFullCameraParameters(cam);
+        InventoryLog.d("PICS PATH RETRIVE MODEL " + infos.toString());
+
         String value = "N/A";
+
         try {
-            String infoModel = Utils.getCatInfoMultiple("/proc/hw_info/camera_info");
-            if ("".equals(infoModel)) {
-                infoModel = Utils.getCatInfoMultiple("/proc/driver/camera_info");
+
+            String CameraFolder="Camera";
+            InventoryLog.d("PICS PATH " + Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM).toString());
+            File CameraDirectory = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM).toString());
+            File[] files = CameraDirectory.listFiles();
+            for (File CurFile : files) {
+                InventoryLog.d("PICS PATH -> " + CurFile.getAbsolutePath());
+                if(CurFile.isDirectory() && CurFile.getAbsolutePath().contains(CameraFolder)){
+                    File PhotoDirectory = new File(CurFile.getAbsolutePath());
+                    File[] photos = PhotoDirectory.listFiles();
+                    for (File CurPhoto : photos) {
+                        InventoryLog.d("PICS PATH ->-> " + CurPhoto.getAbsolutePath());
+                        if(CurPhoto.isFile()){
+                            InventoryLog.d(CurPhoto.getAbsolutePath()+ " Not a directory" );
+                            //is a photo try to load exif informations
+                            ExifInterface exif = new ExifInterface(CurPhoto.getAbsolutePath());
+                            value = exif.getAttribute(ExifInterface.TAG_MODEL);
+                            InventoryLog.d("PICS PATH RETRIVE MODEL ->-> " + exif.getAttribute(ExifInterface.TAG_MODEL));
+                            InventoryLog.d("PICS PATH RETRIVE MODEL ->-> " + exif.getAttribute(ExifInterface.TAG_COPYRIGHT));
+                            InventoryLog.d("PICS PATH RETRIVE MODEL ->-> " + exif.getAttribute(ExifInterface.TAG_DEVICE_SETTING_DESCRIPTION));
+                            InventoryLog.d("PICS PATH RETRIVE MODEL ->-> " + exif.getAttribute(ExifInterface.TAG_Y_RESOLUTION));
+                            InventoryLog.d("PICS PATH RETRIVE MODEL ->-> " + exif.getAttribute(ExifInterface.TAG_X_RESOLUTION));
+                            InventoryLog.d("PICS PATH RETRIVE MODEL ->-> " + exif.getAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION));
+
+
+                        }
+                    }
+
+                }
+
             }
-            if (!"".equals(infoModel) && infoModel.contains(";")) {
-                String infoName = infoModel.split(";", 2)[index];
-                if (infoName.contains(":")) {
-                    String infoValue = infoName.split(":", 2)[1].trim();
-                    if (!"".equals(infoValue)) {
-                        JSONArray jr = new JSONArray(cameraVendors);
-                        for (int i = 0; i < jr.length(); i++) {
-                            JSONObject c = jr.getJSONObject(i);
-                            String id = c.getString("id");
-                            if (infoValue.startsWith(id)) {
-                                value = c.getString("name");
-                                break;
+
+
+            /*final String[] columns = { MediaStore.Images.Media.DATA, MediaStore.Images.Media._ID };
+            final String orderBy = MediaStore.Images.Media._ID;
+            //Stores all the images from the gallery in Cursor
+            Cursor cursor = context.getContentResolver().query(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, columns, null,
+                    null, orderBy);
+            //Total number of images
+            int count = cursor.getCount();
+
+            //Create an array to store path to all the images
+            String path;
+
+            cursor.moveToPosition(0);
+            int dataColumnIndex = cursor.getColumnIndex(MediaStore.Images.Media.DATA);
+            path = cursor.getString(dataColumnIndex);
+            InventoryLog.e("PICS PATH " + path);
+            value = path;*/
+
+        } catch (RuntimeException ex) {
+            InventoryLog.e(InventoryLog.getMessage(context, CommonErrorType.CAMERA_MANUFACTURER, ex.getMessage()));
+            value = "N/A";
+        } catch (IOException ex) {
+            InventoryLog.e(InventoryLog.getMessage(context, CommonErrorType.CAMERA_MANUFACTURER, ex.getMessage()));
+            value = "N/A";
+        }
+
+
+        if(value.isEmpty() || value.equalsIgnoreCase("N/A")){
+            try {
+                String infoModel = Utils.getCatInfoMultiple("/proc/hw_info/camera_info");
+                if ("".equals(infoModel)) {
+                    infoModel = Utils.getCatInfoMultiple("/proc/driver/camera_info");
+                }
+                if (!"".equals(infoModel) && infoModel.contains(";")) {
+                    String infoName = infoModel.split(";", 2)[index];
+                    if (infoName.contains(":")) {
+                        String infoValue = infoName.split(":", 2)[1].trim();
+                        if (!"".equals(infoValue)) {
+                            JSONArray jr = new JSONArray(cameraVendors);
+                            for (int i = 0; i < jr.length(); i++) {
+                                JSONObject c = jr.getJSONObject(i);
+                                String id = c.getString("id");
+                                if (infoValue.startsWith(id)) {
+                                    value = c.getString("name");
+                                    break;
+                                }
                             }
                         }
                     }
                 }
+            } catch (Exception ex) {
+                InventoryLog.e(InventoryLog.getMessage(context, CommonErrorType.CAMERA_MANUFACTURER, ex.getMessage()));
             }
-        } catch (Exception ex) {
-            InventoryLog.e(InventoryLog.getMessage(context, CommonErrorType.CAMERA_MANUFACTURER, ex.getMessage()));
         }
+
         return value;
     }
 
